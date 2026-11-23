@@ -367,3 +367,315 @@ def test_export_csv(client):
     assert "文件名" in text and "清退原因" in text
     response = client.get("/export/basis.csv")
     assert "复算依据" in response.get_data(as_text=True)
+
+
+# ---------- 周报首位站核查 ----------
+
+import verifier  # noqa: E402
+
+
+def check(summary_text, stations, scope, supplements=None):
+    check_state = {
+        "stations": stations,
+        "fleet_scope": scope,
+        "summaries": verifier.parse_summaries(
+            summary_text, stations, planner.scope_fleets(scope)
+        ),
+        "supplements": supplements or {},
+    }
+    return verifier.evaluate(check_state)
+
+
+def summaries(*blocks):
+    rows = ["fleet,total,station,count,cap"]
+    for fleet, total, cap, counts in blocks:
+        if not counts:
+            rows.append(f"{fleet},{total},,,{cap}")
+        for station, count in counts:
+            rows.append(f"{fleet},{total},{station},{count},{cap}")
+    return "\n".join(rows)
+
+
+def test_candidates_only_when_a_completion_can_make_them_first():
+    # 车队 1：总量 100、上限 10、已报 S001=90；车队 2：总量 100、上限 10、已报 S002=96。
+    # S001 最多 94，S003 最多 14，S002 至少 96 → 只有 S002 能排第一。
+    result = check(
+        summaries(("1", 100, 10, [("S001", 90)]), ("2", 100, 10, [("S002", 96)])),
+        ["S001", "S002", "S003"],
+        "1,2",
+    )
+    assert result["status"] == "confirmed"
+    assert result["confirmed"] == "S002"
+
+    # 各 100、上限 100：三站都能通过补全成为第一 → 候选 3 个。
+    result = check(
+        summaries(("1", 100, 100, []), ("2", 100, 100, [])),
+        ["S001", "S002", "S003"],
+        "1,2",
+    )
+    assert result["status"] == "pending"
+    assert set(result["candidates"]) == {"S001", "S002", "S003"}
+
+
+def test_total_constraint_changes_candidates():
+    # 同一个站号集合，只改车队 2 的总量就能把候选从多解收敛为唯一。
+    stations = ["S001", "S002", "S003"]
+    loose = check(
+        summaries(("1", 100, 50, [("S001", 50)]), ("2", 100, 50, [("S002", 50)])),
+        stations,
+        "1,2",
+    )
+    assert loose["status"] == "pending"
+
+    tight = check(
+        summaries(("1", 100, 50, [("S001", 50)]), ("2", 100, 5, [("S002", 95)])),
+        stations,
+        "1,2",
+    )
+    assert tight["status"] == "confirmed"
+    assert tight["confirmed"] == "S002"
+
+
+def test_tie_break_by_station_lexicographic_order():
+    # 车队 1 已报 S001=6，两车队各上限 5、总量 6：S001 已定 6，其它站最多 5，
+    # S001 恒排第一。把站号录入顺序倒过来，结论仍是 S001。
+    result = check(
+        summaries(("1", 6, 5, [("S001", 6)]), ("2", 6, 5, [])),
+        ["S002", "S001"],
+        "1,2",
+    )
+    assert result["status"] == "confirmed"
+    assert result["confirmed"] == "S001"
+
+    # 并列时的字典序：两站都可能达到同样的最高合计，站号小的先排。
+    result = check(
+        summaries(("1", 5, 5, []), ("2", 5, 5, [])),
+        ["S002", "S001"],
+        "1,2",
+    )
+    # 两站上限完全对称，S001 与 S002 都能成为并列第一，故不是唯一候选；
+    # 复核逐站可行性与求解器口径一致。
+    assert "S001" in result["candidates"] and "S002" in result["candidates"]
+
+
+def test_missing_fleet_summary_blocks_and_names_fleet():
+    result = check(summaries(("1", 100, 10, [])), ["S001", "S002"], "1,2")
+    assert result["status"] == "blocked"
+    assert result["missing_fleets"] == ["2"]
+    assert any("2" in item["fleet"] and "缺车队简表" in item["reason"] for item in result["blocked"])
+
+
+def test_infeasible_completion_blocks_and_names_fleet():
+    # 总量 100，已报 90，漏列 1 站但上限只有 5 → 无法补全。
+    result = check(
+        summaries(("1", 100, 5, [("S001", 90)])),
+        ["S001", "S002"],
+        "1",
+    )
+    assert result["status"] == "blocked"
+    assert any(item["fleet"] == "1" and "无法补全" in item["reason"] for item in result["blocked"])
+
+    # 没有任何漏列站点，但已报合计与总量不符，同样无法补全。
+    result = check(
+        summaries(("1", 100, 5, [("S001", 90), ("S002", 5)])),
+        ["S001", "S002"],
+        "1",
+    )
+    assert result["status"] == "blocked"
+
+
+def test_summary_rejects_bad_counts_and_unknown_station():
+    with pytest.raises(importer.ImportError_) as excinfo:
+        verifier.parse_summaries(
+            "fleet,total,station,count,cap\n1,100,S001,-1,10\n1,100,S009,5,10\n",
+            ["S001"],
+            ["1"],
+        )
+    joined = "\n".join(excinfo.value.errors)
+    assert "非负整数" in joined
+    assert "不在已录入的全部站号中" in joined
+
+
+def test_summary_rejects_fleet_outside_scope():
+    with pytest.raises(importer.ImportError_) as excinfo:
+        verifier.parse_summaries(
+            "fleet,total,station,count,cap\n9,100,S001,5,10\n", ["S001"], ["1", "2"]
+        )
+    assert "不在本周报日车队范围" in "\n".join(excinfo.value.errors)
+
+
+def test_supplement_conflicts():
+    parsed = verifier.parse_summaries(
+        "fleet,total,station,count,cap\n1,100,S001,60,50\n", ["S001", "S002"], ["1"]
+    )["1"]
+
+    good = verifier.parse_supplement("station,count\nS001,60\nS002,40\n", ["S001", "S002"])
+    assert verifier.supplement_conflicts(parsed, good, ["S001", "S002"]) == []
+
+    bad_total = verifier.parse_supplement("station,count\nS001,60\nS002,39\n", ["S001", "S002"])
+    assert any("当日总刷卡量" in e for e in verifier.supplement_conflicts(parsed, bad_total, ["S001", "S002"]))
+
+    bad_reported = verifier.parse_supplement("station,count\nS001,61\nS002,39\n", ["S001", "S002"])
+    assert any("已报计数" in e for e in verifier.supplement_conflicts(parsed, bad_reported, ["S001", "S002"]))
+
+    tight = verifier.parse_summaries(
+        "fleet,total,station,count,cap\n1,100,S001,60,10\n", ["S001", "S002"], ["1"]
+    )["1"]
+    over_tight = verifier.parse_supplement("station,count\nS001,60\nS002,40\n", ["S001", "S002"])
+    assert any("单站上限" in e for e in verifier.supplement_conflicts(tight, over_tight, ["S001", "S002"]))
+
+    incomplete = "station,count\nS001,60\n"
+    with pytest.raises(importer.ImportError_) as excinfo:
+        verifier.parse_supplement(incomplete, ["S001", "S002"])
+    assert "覆盖全部站号" in "\n".join(excinfo.value.errors)
+
+
+def import_day(client, report_no="W1", date="2026-05-16", scope='"1,2"'):
+    client.post(
+        "/import/reports",
+        data={"text": f"report_no,date,fleet_scope,dict_version\n{report_no},{date},{scope},v3\n"},
+    )
+
+
+def verify_page(client, report_no="W1", date="2026-05-16"):
+    return client.get(f"/verify/{report_no}/{date}").get_data(as_text=True)
+
+
+def test_verify_page_lists_only_explicit_scope_days(client):
+    client.post(
+        "/import/reports",
+        data={
+            "text": "report_no,date,fleet_scope,dict_version\n"
+            "W1,2026-05-16,1;2,v3\nW2,2026-05-17,*,v3\n"
+        },
+    )
+    body = client.get("/verify").get_data(as_text=True)
+    assert "W1" in body
+    assert "W2" in body  # 以“未列入核查”说明出现
+    assert "无法逐车队收简表" in body
+
+
+def test_web_total_constraint_changes_candidates(client):
+    import_day(client)
+    client.post(
+        "/verify/W1/2026-05-16/stations",
+        data={"stations": "S001,S002,S003"},
+    )
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={
+            "text": "fleet,total,station,count,cap\n"
+            "1,100,,0,50\n1,100,S001,50,50\n"
+            "2,100,,0,50\n2,100,S002,50,50\n"
+        },
+    )
+    body = verify_page(client)
+    assert "候选 3 个" in body
+    assert state()["checks"]["W1|2026-05-16"]["result"]["status"] == "pending"
+
+    # 只改车队 2 的总量约束（100 → 已报 95 + 上限 5），候选收敛为 S002。
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={"text": "fleet,total,station,count,cap\n2,100,S002,95,5\n"},
+    )
+    body = verify_page(client)
+    assert "已核定首位" in body and "S002" in body
+    result = state()["checks"]["W1|2026-05-16"]["result"]
+    assert result["status"] == "confirmed"
+    assert result["confirmed"] == "S002"
+
+
+def test_web_conflicting_supplement_keeps_original_result(client):
+    import_day(client)
+    client.post("/verify/W1/2026-05-16/stations", data={"stations": "S001,S002,S003"})
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={
+            "text": "fleet,total,station,count,cap\n"
+            "1,100,S001,60,30\n"
+            "2,100,S002,95,5\n"
+        },
+    )
+    before = state()["checks"]["W1|2026-05-16"]
+    assert before["result"]["status"] == "confirmed"
+    before_candidates = list(before["result"]["candidates"])
+
+    # 合计正确但改了已报站点 S001 的计数 → 与原简表对不上，整份退回。
+    response = client.post(
+        "/verify/W1/2026-05-16/supplement",
+        data={"fleet": "1", "text": "station,count\nS001,61\nS002,39\nS003,0\n"},
+        follow_redirects=True,
+    )
+    body = response.get_data(as_text=True)
+    assert "整份退回" in body
+    after = state()["checks"]["W1|2026-05-16"]
+    assert after["supplements"] == {}
+    assert after["result"]["candidates"] == before_candidates
+    assert after["result"]["status"] == before["result"]["status"]
+
+    # 有效的补报（合计 100、已报站点不变、漏列站 S002 与 S003 各 20，均不超上限 30）
+    # 替换旧补报，并立即重算候选。
+    client.post(
+        "/verify/W1/2026-05-16/supplement",
+        data={"fleet": "1", "text": "station,count\nS001,60\nS002,20\nS003,20\n"},
+    )
+    after = state()["checks"]["W1|2026-05-16"]
+    assert after["supplements"]["1"]["S002"] == 20
+    assert after["result"]["status"] in {"confirmed", "pending"}
+
+    # 再补一份有效的不同计数：替换而非叠加。
+    client.post(
+        "/verify/W1/2026-05-16/supplement",
+        data={"fleet": "1", "text": "station,count\nS001,60\nS002,25\nS003,15\n"},
+    )
+    after = state()["checks"]["W1|2026-05-16"]
+    assert after["supplements"]["1"]["S002"] == 25
+    assert after["supplements"]["1"]["S003"] == 15
+
+
+def test_web_supplement_requires_full_station_coverage(client):
+    import_day(client)
+    client.post("/verify/W1/2026-05-16/stations", data={"stations": "S001,S002"})
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={"text": "fleet,total,station,count,cap\n1,100,S001,60,10\n2,100,S002,95,5\n"},
+    )
+    response = client.post(
+        "/verify/W1/2026-05-16/supplement",
+        data={"fleet": "1", "text": "station,count\nS001,60\n"},
+        follow_redirects=True,
+    )
+    assert "整份退回" in response.get_data(as_text=True)
+    assert state()["checks"]["W1|2026-05-16"]["supplements"] == {}
+
+
+def test_replacing_summary_drops_conflicting_old_supplement(client):
+    import_day(client)
+    client.post("/verify/W1/2026-05-16/stations", data={"stations": "S001,S002"})
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={"text": "fleet,total,station,count,cap\n1,100,S001,60,50\n2,100,S002,95,5\n"},
+    )
+    client.post(
+        "/verify/W1/2026-05-16/supplement",
+        data={"fleet": "1", "text": "station,count\nS001,60\nS002,40\n"},
+    )
+    assert state()["checks"]["W1|2026-05-16"]["supplements"]["1"]["S002"] == 40
+
+    # 新简表把车队 1 的已报站点改成 S002=70，旧补报 S001=60 与之冲突 → 作废。
+    client.post(
+        "/verify/W1/2026-05-16/summaries",
+        data={"text": "fleet,total,station,count,cap\n1,100,S002,70,50\n"},
+    )
+    after = state()["checks"]["W1|2026-05-16"]
+    assert after["summaries"]["1"]["counts"] == {"S002": 70}
+    assert "1" not in after["supplements"]
+    assert after["result"]["status"] in {"confirmed", "pending", "blocked"}
+
+
+def test_clearing_reports_clears_checks(client):
+    import_day(client)
+    client.post("/verify/W1/2026-05-16/stations", data={"stations": "S001,S002"})
+    assert "W1|2026-05-16" in state()["checks"]
+    client.post("/reports/clear")
+    assert state()["checks"] == {}

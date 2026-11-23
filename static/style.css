@@ -215,6 +215,22 @@ tr.is-offline { background: #fff8f7; }
 .empty { color: var(--muted); font-size: 13px; }
 .warn { color: var(--warn); font-size: 13px; }
 
+.alert.success { background: #e7f6ee; border-color: #bfe6d2; color: var(--ok); }
+.status-ok { background: #e7f6ee; color: var(--ok); }
+.status-pending { background: #fff3e0; color: var(--warn); }
+.status-bad { background: #fdecea; color: var(--bad); }
+.candidate-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill.candidate { background: #e8f0ff; color: #1e4fae; font-size: 13px; padding: 3px 12px; }
+tr.is-candidate { background: #f5f9ff; }
+select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 13px;
+}
+
 details summary { cursor: pointer; color: var(--brand); font-size: 13px; margin-top: 12px; }
 details[open] summary { margin-bottom: 10px; }
 

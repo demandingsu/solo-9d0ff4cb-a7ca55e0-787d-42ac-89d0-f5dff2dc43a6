@@ -24,6 +24,7 @@ from flask import (
 
 import importer
 import planner
+import verifier
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
@@ -54,6 +55,7 @@ def empty_state() -> dict:
         "must_offline": [],
         "plan": None,
         "history": [],
+        "checks": {},
     }
 
 
@@ -150,6 +152,290 @@ def index():
     )
 
 
+# ---------- 周报首位站核查 ----------
+
+# 只有显式列出车队的周报日才能核查；“全部车队”（*）无法给各车队分别收简表。
+def verifiable_reports(state: dict) -> list[dict]:
+    return [
+        report for report in state["reports"] if report["fleet_scope"] not in {"", "*"}
+    ]
+
+
+def current_reports(state: dict) -> set[tuple[str, str]]:
+    return {(r["report_no"], r["date"]) for r in verifiable_reports(state)}
+
+
+def prune_checks(state: dict) -> None:
+    """周报记录被清空或改动后，清掉不再对应当前周报日的核查录入。"""
+    known = current_reports(state)
+    checks = state.get("checks", {})
+    state["checks"] = {
+        key: check
+        for key, check in checks.items()
+        if (check.get("report_no"), check.get("date")) in known
+    }
+
+
+def check_key(report: dict) -> str:
+    return f"{report['report_no']}|{report['date']}"
+
+
+def get_check(state: dict, report: dict) -> dict | None:
+    return state.get("checks", {}).get(check_key(report))
+
+
+def _save_check(state: dict, report: dict, check: dict, result: dict) -> None:
+    check["result"] = result
+    check["evaluated_at"] = datetime.now().isoformat(timespec="seconds")
+    state.setdefault("checks", {})[check_key(report)] = check
+
+
+def _sync_scope(check: dict, report: dict) -> bool:
+    """周报日重新导入后车队范围可能变化，剔除范围外的简表与补报。"""
+    scope = report["fleet_scope"]
+    if check.get("fleet_scope") == scope:
+        return False
+    allowed = set(planner.scope_fleets(scope))
+    check["fleet_scope"] = scope
+    check["summaries"] = {
+        fleet: summary
+        for fleet, summary in check.get("summaries", {}).items()
+        if fleet in allowed
+    }
+    check["supplements"] = {
+        fleet: counts
+        for fleet, counts in check.get("supplements", {}).items()
+        if fleet in allowed
+    }
+    return True
+
+
+def find_report(state: dict, report_no: str, day: str) -> dict | None:
+    for report in verifiable_reports(state):
+        if report["report_no"] == report_no and report["date"] == day:
+            return report
+    return None
+
+
+def _render_check(state: dict, report: dict, status_code: int = 200):
+    check = get_check(state, report)
+    result = None
+    if check is not None:
+        if _sync_scope(check, report):
+            # 只影响本次展示；下次提交时会随状态一起保存。
+            check["result"] = verifier.evaluate(check)
+        result = check.get("result")
+    body = render_template(
+        "check_day.html",
+        report=report,
+        check=check,
+        result=result,
+        type_labels=planner.TYPE_LABELS,
+        scope_display=planner.scope_display,
+    )
+    return body, status_code
+
+
+@app.get("/verify")
+def verify_home():
+    state = load_state()
+    days = []
+    for report in verifiable_reports(state):
+        check = get_check(state, report)
+        if check is not None and _sync_scope(check, report):
+            check["result"] = verifier.evaluate(check)
+        result = check.get("result") if check else None
+        days.append(
+            {
+                "report": report,
+                "key": check_key(report),
+                "exists": check is not None,
+                "status": result["status"] if result else "empty",
+                "confirmed": result["confirmed"] if result else None,
+                "candidate_count": len(result["candidates"]) if result else None,
+                "evaluated_at": check.get("evaluated_at") if check else None,
+            }
+        )
+    skipped = [r for r in state["reports"] if r["fleet_scope"] in {"", "*"}]
+    return render_template("verify.html", days=days, skipped=skipped)
+
+
+@app.get("/verify/<report_no>/<day>")
+def verify_day(report_no: str, day: str):
+    state = load_state()
+    report = find_report(state, report_no, day)
+    if report is None:
+        flash("所选周报日不存在，或车队范围不明确、无法核查。", "error")
+        return redirect(url_for("verify_home"))
+    return _render_check(state, report)
+
+
+@app.post("/verify/<report_no>/<day>/stations")
+@state_transaction
+def verify_stations(report_no: str, day: str):
+    state = load_state()
+    report = find_report(state, report_no, day)
+    if report is None:
+        flash("所选周报日不存在，或车队范围不明确、无法核查。", "error")
+        return redirect(url_for("verify_home"))
+    try:
+        stations = verifier.parse_stations(request.form.get("stations", ""))
+    except importer.ImportError_ as exc:
+        flash(exc.message, "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    check = get_check(state, report) or {
+        "report_no": report_no,
+        "date": day,
+        "fleet_scope": report["fleet_scope"],
+        "dict_version": report["dict_version"],
+        "stations": [],
+        "summaries": {},
+        "supplements": {},
+    }
+    changed = stations != check.get("stations", [])
+    check.update(
+        {
+            "report_no": report_no,
+            "date": day,
+            "fleet_scope": report["fleet_scope"],
+            "dict_version": report["dict_version"],
+            "stations": stations,
+        }
+    )
+    # 换站号后，引用旧站号的计数不再可信，整份清空以免半新半旧。
+    if changed:
+        check["summaries"] = {}
+        check["supplements"] = {}
+    _save_check(state, report, check, verifier.evaluate(check))
+    save_state(state)
+    if changed:
+        flash(f"已录入 {len(stations)} 个站号；站号集变化，原简表与补报已清空。", "success")
+    else:
+        flash(f"已录入 {len(stations)} 个站号，核查结果已更新。", "success")
+    return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+
+@app.post("/verify/<report_no>/<day>/summaries")
+@state_transaction
+def verify_summaries(report_no: str, day: str):
+    state = load_state()
+    report = find_report(state, report_no, day)
+    if report is None:
+        flash("所选周报日不存在，或车队范围不明确、无法核查。", "error")
+        return redirect(url_for("verify_home"))
+    check = get_check(state, report)
+    if not check or not check.get("stations"):
+        flash("请先录入全部站号，再上传车队简表。", "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+    try:
+        text = read_upload("summary_file")
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+    try:
+        summaries = verifier.parse_summaries(
+            text, check["stations"], planner.scope_fleets(report["fleet_scope"])
+        )
+    except importer.ImportError_ as exc:
+        flash(exc.message, "error")
+        for line in exc.errors[:20]:
+            flash(line, "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    merged = dict(check.get("summaries", {}))
+    replaced = sorted(summaries)
+    merged.update(summaries)
+    # 简表被替换后，旧补报可能不再对得上；对不上的补报随之作废，避免新旧口径混用。
+    dropped = []
+    supplements = dict(check.get("supplements", {}))
+    for fleet in replaced:
+        if fleet not in supplements:
+            continue
+        if verifier.supplement_conflicts(
+            merged[fleet], supplements[fleet], check["stations"]
+        ):
+            dropped.append(fleet)
+            del supplements[fleet]
+    check["summaries"] = merged
+    check["supplements"] = supplements
+    _save_check(state, report, check, verifier.evaluate(check))
+    save_state(state)
+    message = f"已接收车队简表：{('、'.join(replaced))}。核查结果已更新。"
+    if dropped:
+        message += f" 车队 {('、'.join(sorted(dropped)))} 的旧补报与新简表对不上，已作废。"
+    flash(message, "success")
+    return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+
+@app.post("/verify/<report_no>/<day>/supplement")
+@state_transaction
+def verify_supplement(report_no: str, day: str):
+    state = load_state()
+    report = find_report(state, report_no, day)
+    if report is None:
+        flash("所选周报日不存在，或车队范围不明确、无法核查。", "error")
+        return redirect(url_for("verify_home"))
+    check = get_check(state, report)
+    if not check or not check.get("stations") or not check.get("summaries"):
+        flash("请先录入全部站号并上传车队简表，再补交全站计数。", "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    fleet = request.form.get("fleet", "").strip()
+    fleets = planner.scope_fleets(report["fleet_scope"])
+    if fleet not in fleets:
+        flash("补交的车队不在本周报日车队范围内。", "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+    summary = check["summaries"].get(fleet)
+    if summary is None:
+        flash(f"车队 {fleet} 还没有简表，请先上传简表再补交全站计数。", "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    try:
+        text = read_upload("supplement_file")
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+    try:
+        counts = verifier.parse_supplement(text, check["stations"])
+    except importer.ImportError_ as exc:
+        flash(f"车队 {fleet} 的补报整份退回，原有计数与候选保持不变。", "error")
+        flash(exc.message, "error")
+        for line in exc.errors[:20]:
+            flash(line, "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    conflicts = verifier.supplement_conflicts(summary, counts, check["stations"])
+    if conflicts:
+        flash(f"车队 {fleet} 的补报与原简表对不上，整份退回；原计数和候选保持不变。", "error")
+        for line in conflicts[:20]:
+            flash(line, "error")
+        return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+    # 有效补报替换该车队的旧补报，并与重算后的候选同时生效。
+    supplements = dict(check.get("supplements", {}))
+    supplements[fleet] = counts
+    check["supplements"] = supplements
+    _save_check(state, report, check, verifier.evaluate(check))
+    save_state(state)
+    flash(f"车队 {fleet} 的全站计数已生效（替换该车队旧补报），候选已重算。", "success")
+    return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+
+@app.post("/verify/<report_no>/<day>/clear")
+@state_transaction
+def verify_clear(report_no: str, day: str):
+    state = load_state()
+    report = find_report(state, report_no, day)
+    if report is None:
+        flash("所选周报日不存在，或车队范围不明确、无法核查。", "error")
+        return redirect(url_for("verify_home"))
+    state.get("checks", {}).pop(check_key(report), None)
+    save_state(state)
+    flash("已清除该周报日的核查录入。", "success")
+    return redirect(url_for("verify_day", report_no=report_no, day=day))
+
+
 def _group_reports(reports: list[dict]) -> list[dict]:
     groups: dict[str, list[dict]] = {}
     for report in reports:
@@ -230,6 +516,7 @@ def import_reports():
         )
         return redirect(url_for("index"))
     state["reports"].extend(added)
+    prune_checks(state)
     message = f"已导入 {len(added)} 条周报日记录，当前共 {len(state['reports'])} 条。"
     if skipped:
         message += f" 跳过重复 {skipped} 条。"
@@ -244,6 +531,7 @@ def clear_reports():
     state = load_state()
     state["reports"] = []
     state["plan"] = None
+    state["checks"] = {}
     save_state(state)
     flash("已清空周报日记录，清退单已作废。", "success")
     return redirect(url_for("index"))

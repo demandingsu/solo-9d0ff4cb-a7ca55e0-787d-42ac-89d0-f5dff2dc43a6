@@ -13,6 +13,7 @@
     <p class="subtitle">按客流周报原口径复算，找总字节最少的留存方案</p>
   </div>
   <div class="topbar-actions">
+    <a class="btn ghost" href="{{ url_for('verify_home') }}">周报首位站核查</a>
     <form method="post" action="{{ url_for('load_demo') }}">
       <button class="btn ghost" type="submit">载入示例</button>
     </form>

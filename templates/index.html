@@ -143,6 +143,20 @@ W2026-21,2026-05-16,1;2,v3"></textarea>
 
 <section class="panel">
   <div class="panel-head">
+    <h2>周报首位站核查</h2>
+    <span class="badge">另一个入口</span>
+  </div>
+  <p class="muted">
+    周报要写当天客流最高的站，但部分车队只上报部分站点计数。到核查页选择车队范围明确的周报日，
+    录入全部站号与各车队简表，查看能在合法补全中排第一的站点。
+  </p>
+  <div class="form-actions">
+    <a class="btn" href="{{ url_for('verify_home') }}">进入周报首位站核查</a>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
     <h2>④ 核算留存方案</h2>
     {% if plan %}
       <span class="badge {{ 'badge-ok' if plan.status == 'ok' else 'badge-bad' }}">

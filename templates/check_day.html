@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% block title %}核查 {{ report.report_no }} / {{ report.date }}{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>核查 {{ report.report_no }} · {{ report.date }}</h2>
+    <span class="badge">车队范围 {{ scope_display(report.fleet_scope) }} · 字典 {{ report.dict_version }}</span>
+  </div>
+  <div class="form-actions">
+    <a class="btn small ghost" href="{{ url_for('verify_home') }}">返回周报日列表</a>
+    {% if check %}
+    <form method="post" action="{{ url_for('verify_clear', report_no=report.report_no, day=report.date) }}"
+          onsubmit="return confirm('清除本周报日的站号、简表与补报？');">
+      <button class="btn small ghost danger" type="submit">清除本日录入</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>① 录入全部站号</h2>
+    <span class="badge">{{ check.stations|length if check else 0 }} 个</span>
+  </div>
+  <form method="post" action="{{ url_for('verify_stations', report_no=report.report_no, day=report.date) }}">
+    <textarea name="stations" rows="3" placeholder="全部站号，用逗号、空格或分号分隔。示例：S001,S002,S003">{{ check.stations|join(",") if check else "" }}</textarea>
+    <div class="form-actions">
+      <button class="btn" type="submit">保存站号</button>
+      <span class="hint">站号是排序、同量比较的依据；改动站号集后，原简表与补报会被清空。</span>
+    </div>
+  </form>
+</section>
+
+{% if check and check.stations %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>② 上传各车队简表</h2>
+    <span class="badge">{{ check.summaries|length }} / {{ check.fleet_scope.split(",")|length }} 个车队</span>
+  </div>
+  <form method="post" action="{{ url_for('verify_summaries', report_no=report.report_no, day=report.date) }}"
+        enctype="multipart/form-data" class="import-form">
+    <div class="import-grid">
+      <label class="file-drop">
+        <span>选择 CSV 文件</span>
+        <input type="file" name="summary_file" accept=".csv,.txt,text/csv,text/plain">
+      </label>
+      <div class="or">或</div>
+      <textarea name="text" rows="5" placeholder="各车队简表，首行为表头。示例：
+fleet,total,station,count,cap
+1,1200,S001,300,40
+1,1200,S004,200,40
+2,900,,,35
+2,900,S002,100,35"></textarea>
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">保存简表（按车队覆盖）</button>
+      <span class="hint">
+        每行：车队、当日总刷卡量、站号（可空）、该站计数、漏列站点的单站上限。同一车队的
+        total 与 cap 须每行一致；已报站点不要重复。只上传部分车队也可以，缺失的车队会单独列出。
+      </span>
+    </div>
+  </form>
+</section>
+{% endif %}
+
+{% if result %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>核查结果</h2>
+    <span class="muted">重算于 {{ check.evaluated_at }}</span>
+  </div>
+
+  {% if result.status == "blocked" %}
+    <div class="alert error">
+      <strong>暂缓核定。</strong>
+      下列车队或缺简表，或无法按总量、已报计数与漏列上限补全；补齐后可重新判定。
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>车队</th><th>原因</th></tr></thead>
+        <tbody>
+        {% for item in result.blocked %}
+          <tr>
+            <td class="mono">{{ item.fleet }}</td>
+            <td class="bad-text">{{ item.reason }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% elif result.status == "confirmed" %}
+    <div class="alert success">
+      <strong>已核定首位：<span class="mono">{{ result.confirmed }}</span></strong>
+      全部合法补全下，只有这一个站点能排第一。
+    </div>
+  {% else %}
+    <div class="alert warn">
+      <strong>候选 {{ result.candidates|length }} 个，暂不核定。</strong>
+      当前数据下这些站点都能在某种合法补全中排第一，需要更多车队补报全站计数才能收敛。
+    </div>
+  {% endif %}
+
+  {% if result.candidates %}
+  <h3>可排第一的站点</h3>
+  <div class="candidate-list">
+    {% for station in result.candidates %}
+      <span class="pill candidate">{{ station }}</span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <h3>各车队简表与补全范围</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>车队</th><th>当日总量</th><th>已报合计</th><th>漏列站数</th><th>仍需补</th><th>单站上限</th><th>补报</th><th>状态</th></tr>
+      </thead>
+      <tbody>
+      {% for row in result.fleet_rows %}
+        <tr>
+          <td class="mono">{{ row.fleet }}</td>
+          <td class="num">{{ "{:,}".format(row.total) if row.total is not none else "—" }}</td>
+          <td class="num">{{ "{:,}".format(row.reported_sum) if row.reported_sum is not none else "—" }}</td>
+          <td class="num">{{ row.unlisted_count }}</td>
+          <td class="num">{{ "{:,}".format(row.remaining) if row.remaining is not none else "—" }}</td>
+          <td class="num">{{ row.cap if row.cap is not none else "—" }}</td>
+          <td>{{ "已补交全站计数" if row.supplement else "未补交" }}</td>
+          <td>
+            {% if row.status == "ok" %}<span class="pill status-ok">可补全</span>
+            {% elif row.status == "missing" %}<span class="pill status-bad">缺简表</span>
+            {% else %}<span class="pill status-bad">无法补全</span>{% endif %}
+            {% if row.reason %}<div class="bad-text">{{ row.reason }}</div>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if result.station_rows %}
+  <details class="inventory-view">
+    <summary>查看各站客流范围（{{ result.station_rows|length }} 个站）</summary>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>站号</th><th>已定计数</th><th>最小合计</th><th>最大合计</th><th>候选</th></tr></thead>
+        <tbody>
+        {% for row in result.station_rows %}
+          <tr class="{{ 'is-candidate' if row.candidate }}">
+            <td class="mono">{{ row.station }}</td>
+            <td class="num">{{ "{:,}".format(row.reported_total) }}</td>
+            <td class="num">{{ "{:,}".format(row.min_total) }}</td>
+            <td class="num">{{ "{:,}".format(row.max_total) }}</td>
+            <td>{% if row.candidate %}<span class="pill candidate">候选</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>③ 某车队补交全站计数</h2>
+    <span class="badge">须覆盖全部 {{ check.stations|length }} 个站号</span>
+  </div>
+  <form method="post" action="{{ url_for('verify_supplement', report_no=report.report_no, day=report.date) }}"
+        enctype="multipart/form-data" class="import-form">
+    <div class="import-grid">
+      <label class="file-drop">
+        <span>选择 CSV 文件</span>
+        <input type="file" name="supplement_file" accept=".csv,.txt,text/csv,text/plain">
+      </label>
+      <div class="or">或</div>
+      <textarea name="text" rows="5" placeholder="全站计数，首行为表头。示例：
+station,count
+S001,300
+S002,100
+S003,0"></textarea>
+    </div>
+    <div class="form-actions">
+      <label>车队
+        <select name="fleet" class="mono">
+          {% for fleet in check.fleet_scope.split(",") %}<option value="{{ fleet }}">{{ fleet }}</option>{% endfor %}
+        </select>
+      </label>
+      <button class="btn" type="submit">提交补报</button>
+      <span class="hint">
+        补报须与原简表对得上：全站合计等于该车队当日总量，已报站点计数不变，漏列站不超过单站上限。
+        对不上就整份退回，原有计数与候选保持不变；有效补报会替换该车队的旧补报并立即重算候选。
+      </span>
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

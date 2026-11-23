@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}周报首位站核查{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>周报首位站核查</h2>
+    <span class="badge">选择周报日</span>
+  </div>
+  <p class="hint">
+    周报要写出当天客流最高的站，但部分车队只上报了部分站点计数。选择车队范围明确的周报日，
+    录入全部站号并上传各车队简表，页面会列出“能在至少一种合法补全中排第一”的站点；
+    只有唯一候选时才核定首位。车队范围写“全部车队”的周报日无法逐车队收简表，不在此核查。
+  </p>
+
+  {% if days %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>周报编号</th><th>日期</th><th>车队范围</th><th>字典版本</th><th>核查状态</th><th></th></tr></thead>
+      <tbody>
+      {% for item in days %}
+        <tr>
+          <td class="mono">{{ item.report.report_no }}</td>
+          <td>{{ item.report.date }}</td>
+          <td>{{ scope_display(item.report.fleet_scope) }}</td>
+          <td class="mono">{{ item.report.dict_version }}</td>
+          <td>
+            {% if item.status == "confirmed" %}
+              <span class="pill status-ok">已核定 {{ item.confirmed }}</span>
+            {% elif item.status == "pending" %}
+              <span class="pill status-pending">{{ item.candidate_count }} 个候选</span>
+            {% elif item.status == "blocked" %}
+              <span class="pill status-bad">暂缓核定</span>
+            {% else %}
+              <span class="muted">未录入</span>
+            {% endif %}
+          </td>
+          <td><a class="btn small ghost" href="{{ url_for('verify_day', report_no=item.report.report_no, day=item.report.date) }}">进入核查</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="empty">还没有可核查的周报日。请先在首页导入周报记录，且车队范围须写成明确的车队列表（如 <span class="mono">1;2</span>）。</p>
+  {% endif %}
+
+  {% if skipped %}
+    <p class="warn">以下周报日车队范围为“全部车队”，无法逐车队收简表，未列入核查：{{ skipped|map(attribute="report_no")|unique|join("、") }}。</p>
+  {% endif %}
+</section>
+{% endblock %}

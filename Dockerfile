@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py importer.py planner.py ./
+COPY app.py importer.py planner.py verifier.py ./
 COPY templates ./templates
 COPY static ./static
 
