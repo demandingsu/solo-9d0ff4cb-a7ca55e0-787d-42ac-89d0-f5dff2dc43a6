@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% set plan = state.plan %}
+{% set stale = stale %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>① 在库文件清单</h2>
+    <span class="badge">{{ state.inventory|length }} 个文件 · {{ "{:,}".format(sizes.inventory) }} 字节</span>
+  </div>
+  <form method="post" action="{{ url_for('import_inventory') }}" enctype="multipart/form-data" class="import-form">
+    <div class="import-grid">
+      <label class="file-drop">
+        <span>选择 CSV 文件</span>
+        <input type="file" name="inventory_file" accept=".csv,.txt,text/csv,text/plain">
+      </label>
+      <div class="or">或</div>
+      <textarea name="text" rows="4" placeholder="粘贴清单，首行为表头。示例：
+file_id,type,size_bytes,date,fleet,fleet_scope,dict_version
+AGG-0516,daily_agg,1.2MB,2026-05-16,1,1,2,v3"></textarea>
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">导入 / 替换清单</button>
+      <span class="hint">列：file_id, type(daily_agg/tap/dict/other), size_bytes（支持 1.5GiB）, date, fleet, fleet_scope, dict_version。字段名可用中文。</span>
+    </div>
+  </form>
+
+  {% if state.inventory %}
+  <details class="inventory-view">
+    <summary>查看已导入文件（{{ state.inventory|length }}）</summary>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件名</th><th>类型</th><th>字节数</th><th>日期</th><th>车队</th><th>车队范围</th><th>字典版本</th></tr></thead>
+        <tbody>
+        {% for f in state.inventory %}
+          <tr>
+            <td class="mono">{{ f.file_id }}</td>
+            <td><span class="pill t-{{ f.type }}">{{ type_labels.get(f.type, f.type) }}</span></td>
+            <td class="num">{{ "{:,}".format(f.size_bytes) }}</td>
+            <td>{{ f.date or "—" }}</td>
+            <td>{{ f.fleet or "—" }}</td>
+            <td>{{ scope_display(f.fleet_scope) }}</td>
+            <td>{{ f.dict_version or "—" }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>② 周报日记录</h2>
+    <span class="badge">{{ state.reports|length }} / {{ max_days }} 条</span>
+  </div>
+  <form method="post" action="{{ url_for('import_reports') }}" enctype="multipart/form-data" class="import-form">
+    <div class="import-grid">
+      <label class="file-drop">
+        <span>选择 CSV 文件</span>
+        <input type="file" name="reports_file" accept=".csv,.txt,text/csv,text/plain">
+      </label>
+      <div class="or">或</div>
+      <textarea name="text" rows="4" placeholder="粘贴周报日记录，首行为表头。示例：
+report_no,date,fleet_scope,dict_version
+W2026-21,2026-05-16,1;2,v3"></textarea>
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">导入周报（追加）</button>
+      <span class="hint">每条 = 周报编号 + 日期 + 车队范围 + 字典版本；最多 12 条。车队范围写“*”或“全部”表示当天全部车队。</span>
+    </div>
+  </form>
+
+  {% if state.reports %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>周报编号</th><th>日期</th><th>车队范围</th><th>字典版本</th></tr></thead>
+      <tbody>
+        {% for group in report_groups %}
+          {% for day in group.days %}
+          <tr>
+            <td class="mono">{{ day.report_no }}</td>
+            <td>{{ day.date }}</td>
+            <td>{{ scope_display(day.fleet_scope) }}</td>
+            <td class="mono">{{ day.dict_version }}</td>
+          </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <form method="post" action="{{ url_for('clear_reports') }}" onsubmit="return confirm('清空全部周报日记录？');">
+    <button class="btn ghost danger small" type="submit">清空周报记录</button>
+  </form>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>③ 勾选必须下线的文件</h2>
+    <span class="badge">{{ state.must_offline|length }} 个 · {{ "{:,}".format(sizes.must_offline) }} 字节</span>
+  </div>
+  {% if not state.inventory %}
+    <p class="empty">先导入在库文件清单。</p>
+  {% else %}
+  <form method="post" action="{{ url_for('update_offline') }}">
+    <div class="table-wrap offline-list">
+      <table>
+        <thead><tr><th class="check-col">下线</th><th>文件名</th><th>类型</th><th>字节数</th><th>业务归属</th></tr></thead>
+        <tbody>
+        {% for f in state.inventory %}
+          <tr class="{{ 'is-offline' if f.file_id in state.must_offline }}">
+            <td class="check-col">
+              <input type="checkbox" name="must_offline" value="{{ f.file_id }}" id="off-{{ loop.index }}"
+                     {{ "checked" if f.file_id in state.must_offline }}>
+            </td>
+            <td><label for="off-{{ loop.index }}" class="mono">{{ f.file_id }}</label></td>
+            <td><span class="pill t-{{ f.type }}">{{ type_labels.get(f.type, f.type) }}</span></td>
+            <td class="num">{{ "{:,}".format(f.size_bytes) }}</td>
+            <td class="muted">
+              {% if f.type == "daily_agg" %}{{ f.date }} · {{ scope_display(f.fleet_scope) }} · 字典 {{ f.dict_version }}
+              {% elif f.type == "tap" %}{{ f.date }} · 车队 {{ f.fleet }}
+              {% elif f.type == "dict" %}字典 {{ f.dict_version }}
+              {% else %}—{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">保存勾选</button>
+      <span class="hint">勾选后须重新核算；被勾选的文件不会进入任何复算依据。</span>
+    </div>
+  </form>
+  {% if unknown_offline %}
+    <p class="warn">以下已勾选文件已不在在库清单中：{{ unknown_offline|join("、") }}</p>
+  {% endif %}
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>④ 核算留存方案</h2>
+    {% if plan %}
+      <span class="badge {{ 'badge-ok' if plan.status == 'ok' else 'badge-bad' }}">
+        {{ "方案可确认" if plan.status == "ok" else "已暂停清退" }}
+      </span>
+    {% endif %}
+  </div>
+  <form method="post" action="{{ url_for('create_plan') }}" class="form-actions">
+    <button class="btn primary" type="submit" {{ "disabled" if not state.inventory or not state.reports }}>
+      {{ "重新核算" if plan else "核算" }}
+    </button>
+    <span class="hint">为所有周报日各选一种复算依据，使留存文件并集总字节最少；共用文件只计一次。</span>
+  </form>
+
+  {% if stale %}
+    <div class="alert warn">
+      <strong>旧清退单已过期。</strong>
+      周报记录、文件清单或下线勾选在核算后发生了变化，须重新核算后才能确认。
+    </div>
+  {% endif %}
+</section>
+
+{% if plan %}
+<section class="panel plan-panel">
+  <div class="panel-head">
+    <h2>核算结果</h2>
+    <span class="muted">生成于 {{ plan.created_at }}</span>
+  </div>
+
+  {% if plan.status == "blocked" %}
+    <div class="alert error">
+      <strong>缺少复算依据，清退已暂停。</strong>
+      请补齐下列周报日的日汇总，或当天所需车队的全部刷卡分区 + 该版归站字典，且不要勾选它们下线。
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>周报编号</th><th>日期</th><th>车队范围</th><th>字典版本</th><th>缺失说明</th></tr></thead>
+        <tbody>
+        {% for day in plan.missing %}
+          <tr>
+            <td class="mono">{{ day.report_no }}</td>
+            <td><strong>{{ day.date }}</strong></td>
+            <td>{{ day.fleet_scope_display }}</td>
+            <td class="mono">{{ day.dict_version }}</td>
+            <td class="bad-text">{{ day.reasons|join("；") }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="form-actions">
+      <a class="btn ghost" href="{{ url_for('export_csv', kind='missing') }}">导出缺失清单 CSV</a>
+    </div>
+  {% else %}
+    <div class="stats">
+      <div class="stat"><span class="stat-label">周报日</span><span class="stat-value">{{ plan.summary.day_count }}</span></div>
+      <div class="stat"><span class="stat-label">留存文件</span><span class="stat-value">{{ plan.summary.retained_count }}</span><span class="stat-sub">{{ "{:,}".format(plan.summary.retained_bytes) }} 字节</span></div>
+      <div class="stat"><span class="stat-label">清退文件</span><span class="stat-value">{{ plan.summary.cleared_count }}</span><span class="stat-sub">{{ "{:,}".format(plan.summary.cleared_bytes) }} 字节</span></div>
+      <div class="stat"><span class="stat-label">腾出比例</span><span class="stat-value">{{ "%.1f"|format(plan.summary.release_ratio) }}%</span><span class="stat-sub">占在库字节</span></div>
+      <div class="stat"><span class="stat-label">共用文件</span><span class="stat-value">{{ plan.summary.shared_file_count }}</span><span class="stat-sub">省 {{ "{:,}".format(plan.summary.shared_saving_bytes) }} 字节</span></div>
+    </div>
+    {% if plan.summary.must_offline_count %}
+    <p class="muted">已避开 {{ plan.summary.must_offline_count }} 个必须下线文件（{{ "{:,}".format(plan.summary.must_offline_bytes) }} 字节），它们全部进入清退清单，不计入任何复算依据。</p>
+    {% endif %}
+    {% if plan.summary.must_offline_not_in_inventory %}
+    <p class="warn">以下勾选的文件不在本次在库清单中，已忽略：{{ plan.summary.must_offline_not_in_inventory|join("、") }}</p>
+    {% endif %}
+
+    <h3>逐日复算依据</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>周报编号</th><th>日期</th><th>车队范围</th><th>字典版本</th><th>依据</th><th>文件（字节）</th><th>共用</th></tr></thead>
+        <tbody>
+        {% for day in plan.days %}
+          <tr>
+            <td class="mono">{{ day.report_no }}</td>
+            <td>{{ day.date }}</td>
+            <td>{{ day.fleet_scope_display }}</td>
+            <td class="mono">{{ day.dict_version }}</td>
+            <td><span class="pill basis-{{ day.basis_kind }}">{{ day.basis_label }}</span></td>
+            <td>
+              <ul class="file-list">
+              {% for f in day.files %}
+                <li><span class="mono">{{ f.file_id }}</span> <span class="muted">{{ "{:,}".format(f.size_bytes) }}</span>
+                  {% if f.shared_count > 1 %}<span class="shared-tag">共用 {{ f.shared_count }} 日</span>{% endif %}
+                </li>
+              {% endfor %}
+              </ul>
+            </td>
+            <td class="num">{{ "{:,}".format(day.bytes) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h3>共用文件（只计一次）</h3>
+    {% if plan.shared %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件名</th><th>类型</th><th>字节数</th><th>被以下周报日引用</th><th>若重复计多出</th></tr></thead>
+        <tbody>
+        {% for f in plan.shared %}
+          <tr>
+            <td class="mono">{{ f.file_id }}</td>
+            <td><span class="pill t-{{ f.type }}">{{ type_labels.get(f.type, f.type) }}</span></td>
+            <td class="num">{{ "{:,}".format(f.size_bytes) }}</td>
+            <td>{{ f.refs|join("；") }}</td>
+            <td class="num">{{ "{:,}".format(f.saved_bytes) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <p class="empty">本次无跨日共用的留存文件。</p>
+    {% endif %}
+
+    <h3>清退清单 <span class="muted">（{{ plan.cleared|length }} 个文件，{{ "{:,}".format(plan.summary.cleared_bytes) }} 字节）</span></h3>
+    {% if plan.cleared %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件名</th><th>类型</th><th>字节数</th><th>原因</th></tr></thead>
+        <tbody>
+        {% for f in plan.cleared %}
+          <tr>
+            <td class="mono">{{ f.file_id }}</td>
+            <td><span class="pill t-{{ f.type }}">{{ type_labels.get(f.type, f.type) }}</span></td>
+            <td class="num">{{ "{:,}".format(f.size_bytes) }}</td>
+            <td class="muted">{{ f.clear_reason }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="form-actions">
+      <a class="btn ghost" href="{{ url_for('export_csv', kind='cleared') }}">导出清退清单 CSV</a>
+      <a class="btn ghost" href="{{ url_for('export_csv', kind='basis') }}">导出逐日依据 CSV</a>
+    </div>
+    {% else %}
+      <p class="empty">没有需要清退的文件。</p>
+    {% endif %}
+
+    <h3>留存文件 <span class="muted">（{{ plan.retained|length }} 个，{{ "{:,}".format(plan.summary.retained_bytes) }} 字节）</span></h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>文件名</th><th>类型</th><th>字节数</th><th>业务归属</th></tr></thead>
+        <tbody>
+        {% for f in plan.retained %}
+          <tr>
+            <td class="mono">{{ f.file_id }}</td>
+            <td><span class="pill t-{{ f.type }}">{{ type_labels.get(f.type, f.type) }}</span></td>
+            <td class="num">{{ "{:,}".format(f.size_bytes) }}</td>
+            <td class="muted">
+              {% if f.type == "daily_agg" %}{{ f.date }} · {{ scope_display(f.fleet_scope) }} · 字典 {{ f.dict_version }}
+              {% elif f.type == "tap" %}{{ f.date }} · 车队 {{ f.fleet }}
+              {% elif f.type == "dict" %}字典 {{ f.dict_version }}
+              {% else %}—{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="confirm-bar">
+      <form method="post" action="{{ url_for('confirm_plan') }}"
+            onsubmit="return confirm('确认后仅更新在库登记，移出 {{ plan.cleared|length }} 个文件。继续？');">
+        <button class="btn primary" type="submit" {{ "disabled" if stale }}>确认清退并更新在库登记</button>
+      </form>
+      <span class="hint">确认只改在库登记，不删除磁盘文件；下次核算按剩余文件进行。</span>
+    </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if history %}
+<section class="panel">
+  <div class="panel-head"><h2>确认历史</h2></div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>确认时间</th><th>周报日</th><th>清退文件</th><th>清退字节</th><th>剩余在库</th><th>剩余字节</th></tr></thead>
+      <tbody>
+      {% for item in history %}
+        <tr>
+          <td>{{ item.confirmed_at }}</td>
+          <td class="num">{{ item.day_count }}</td>
+          <td class="num">{{ item.cleared_count }}</td>
+          <td class="num">{{ "{:,}".format(item.cleared_bytes) }}</td>
+          <td class="num">{{ item.retained_count }}</td>
+          <td class="num">{{ "{:,}".format(item.retained_bytes) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

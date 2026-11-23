@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}公交刷卡历史数据清退台账{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>公交刷卡历史数据清退台账</h1>
+    <p class="subtitle">按客流周报原口径复算，找总字节最少的留存方案</p>
+  </div>
+  <div class="topbar-actions">
+    <form method="post" action="{{ url_for('load_demo') }}">
+      <button class="btn ghost" type="submit">载入示例</button>
+    </form>
+    <form method="post" action="{{ url_for('reset') }}" onsubmit="return confirm('确认清空所有导入与清退记录？');">
+      <button class="btn ghost danger" type="submit">清空全部</button>
+    </form>
+  </div>
+</header>
+
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+
+  <footer class="footnote">
+    <p>规则：日汇总须与周报的日期、车队范围、字典版本三项完全吻合；否则须当天所需车队的全部刷卡分区，加一份该版本归站字典。共用文件只计一次。缺依据时暂停清退。</p>
+  </footer>
+</main>
+</body>
+</html>
